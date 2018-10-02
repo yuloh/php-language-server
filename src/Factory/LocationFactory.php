@@ -7,6 +7,7 @@ use LanguageServerProtocol\Position;
 use LanguageServerProtocol\Range;
 use Microsoft\PhpParser\Node;
 use Microsoft\PhpParser\PositionUtilities;
+use Microsoft\PhpParser\Token;
 
 class LocationFactory
 {

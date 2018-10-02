@@ -22,10 +22,13 @@ use LanguageServerProtocol\{
     SymbolLocationInformation,
     TextDocumentIdentifier,
     TextDocumentItem,
+    TextEdit,
     VersionedTextDocumentIdentifier,
+    WorkspaceEdit,
     CompletionContext
 };
 use Microsoft\PhpParser\Node;
+use Microsoft\PhpParser\PositionUtilities;
 use Sabre\Event\Promise;
 use Sabre\Uri;
 use function LanguageServer\{
@@ -422,6 +425,106 @@ class TextDocument
             }
             $descriptor = new SymbolDescriptor($def->fqn, new PackageDescriptor($packageName));
             return [new SymbolLocationInformation($descriptor, $def->symbolInformation->location)];
+        });
+    }
+
+    /**
+     * The rename request is sent from the client to the server to perform a workspace-wide rename of a symbol.
+     *
+     * @param  TextDocumentIdentifier $textDocument The document to rename.
+     * @param  Position               $position     The position at which this request was sent.
+     * @param  string                 $newName      The new name of the symbol.
+     * @return Promise <WorkspaceEdit|null>
+     */
+    public function rename(TextDocumentIdentifier $textDocument, Position $position, string $newName): Promise
+    {
+        return coroutine(function () use ($textDocument, $position, $newName) {
+            $document = yield $this->documentLoader->getOrLoad($textDocument->uri);
+            $node = $document->getNodeAtPosition($position);
+            if ($node === null) {
+                return null;
+            }
+            $changes = [];
+            // Variables always stay in the boundary of the file and need to be searched inside their function scope
+            // by traversing the AST
+            if (
+
+            ($node instanceof Node\Expression\Variable && !($node->getParent()->getParent() instanceof Node\PropertyDeclaration))
+                || $node instanceof Node\Parameter
+                || $node instanceof Node\UseVariableName
+            ) {
+                if (isset($node->name) && $node->name instanceof Node\Expression) {
+                    return null;
+                }
+                $location = LocationFactory::fromNode($node);
+                $changes[$location->uri] = [
+                    new TextEdit($location->range, $newName),
+                ];
+                // Find function/method/closure scope
+                $n = $node;
+
+                $n = $n->getFirstAncestor(Node\Statement\FunctionDeclaration::class, Node\MethodDeclaration::class, Node\Expression\AnonymousFunctionCreationExpression::class, Node\SourceFileNode::class);
+
+                if ($n === null) {
+                    $n = $node->getFirstAncestor(Node\Statement\ExpressionStatement::class)->getParent();
+                }
+
+                foreach ($n->getDescendantNodes() as $descendantNode) {
+                    if ($descendantNode instanceof Node\Expression\Variable &&
+                        $descendantNode->getName() === $node->getName()
+                    ) {
+                        $location = LocationFactory::fromNode($descendantNode);
+                        if (!isset($changes[$location->uri])) {
+                            $changes[$location->uri] = [];
+                        }
+                        $changes[$location->uri][] = new TextEdit($location->range, '$' . $newName);
+                    }
+                }
+            } else {
+                $range = PositionUtilities::getRangeFromPosition(
+                    $node->name->getStartPosition(),
+                    $node->name->getWidth(),
+                    $node->getFileContents()
+                );
+                $location = new Location($node->getUri(), new Range(
+                    new Position($range->start->line, $range->start->character),
+                    new Position($range->end->line, $range->end->character)
+                ));
+                $changes[$location->uri] = [
+                    new TextEdit($location->range, $newName),
+                ];
+                // Definition with a global FQN
+                $fqn = DefinitionResolver::getDefinedFqn($node);
+
+                // Wait until indexing finished
+                if (!$this->index->isComplete()) {
+                    yield waitForEvent($this->index, 'complete');
+                }
+                if ($fqn === null) {
+                    $fqn = $this->definitionResolver->resolveReferenceNodeToFqn($node);
+                    if ($fqn === null) {
+                        return null;
+                    }
+                }
+                $refDocuments = yield Promise\all(array_map(
+                    [$this->documentLoader, 'getOrLoad'],
+                    $this->index->getReferenceUris($fqn)
+                ));
+                foreach ($refDocuments as $document) {
+                    $refs = $document->getReferenceNodesByFqn($fqn);
+                    if ($refs !== null) {
+                        foreach ($refs as $ref) {
+                            $location = LocationFactory::fromNode($ref);
+                            if (!isset($changes[$location->uri])) {
+                                $changes[$location->uri] = [];
+                            }
+                            $changes[$location->uri][] = new TextEdit($location->range, $newName);
+                        }
+                    }
+                }
+            }
+
+            return new WorkspaceEdit($changes);
         });
     }
 }
